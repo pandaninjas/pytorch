@@ -6,6 +6,7 @@
 
 #include <ATen/mps/MPSDevice.h>
 #include <c10/core/CPUAllocator.h>
+#include <c10/util/RefcountedDeleter.h>
 #include <libshm.h>
 #include <torch/csrc/CudaIPCTypes.h>
 #include <torch/csrc/Device.h>
@@ -86,21 +87,34 @@ PyObject* THPStorage_NewWithStorage(
 
 // Wraps the c10::Storage with a storage PyObject
 PyObject* THPStorage_Wrap(c10::Storage storage) {
+  c10::StorageImpl* storage_impl = storage.unsafeGetStorageImpl();
   if (c10::impl::HermeticPyObjectTLS::get_state()) {
     return THPStorage_NewWithStorage(
         THPStorageClass,
         std::move(storage),
         c10::impl::PyInterpreterStatus::DEFINITELY_UNINITIALIZED);
   }
-  c10::StorageImpl* storage_impl = storage.unsafeGetStorageImpl();
+  c10::impl::PyObjectSlot* pyobj_slot = storage_impl->pyobj_slot();
+
+  // If the StorageImpl has a PyObject that is managed by a different
+  // interpreter than the current one, create a new StorageImpl that points to
+  // the same data and then create the Python storage from that.
+  // NOTE: This is only supposed to happen in MultiPy
+  if (pyobj_slot->has_pyobj() &&
+      !pyobj_slot->check_interpreter(getPyInterpreter())) {
+    return THPStorage_NewWithStorage(
+        THPStorageClass,
+        c10::newStorageImplFromRefcountedDataPtr(storage),
+        c10::impl::PyInterpreterStatus::DEFINITELY_UNINITIALIZED);
+  }
   c10::optional<PyObject*> maybe_pyobj =
-      storage_impl->pyobj_slot()->check_pyobj(getPyInterpreter());
+      pyobj_slot->check_pyobj(getPyInterpreter());
   c10::impl::PyInterpreterStatus status;
   if (maybe_pyobj.has_value()) {
     auto obj = *maybe_pyobj;
     if (obj) {
-      if (storage_impl->pyobj_slot()->owns_pyobj()) {
-        storage_impl->pyobj_slot()->set_owns_pyobj(false);
+      if (pyobj_slot->owns_pyobj()) {
+        pyobj_slot->set_owns_pyobj(false);
         reinterpret_cast<THPStorage*>(obj)->cdata =
             c10::MaybeOwned<c10::Storage>::owned(std::move(storage));
         return obj;
